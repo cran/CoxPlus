@@ -1,9 +1,9 @@
-f08c129dddcffd2d8f980f2055a951ce *DESCRIPTION
+efa9178e94487bd33ad2c392ec3f1037 *DESCRIPTION
 0e8454e7957ec0510690b363ecf285f0 *NAMESPACE
 8347fd3e67a6ad10e6552e509283ee3f *R/cumHazard.R
 e4c1c7e1068785b35afe8152496f244c *R/fastCox.R
 c7df4d41b812496bd716a14126d6d8bd *man/CoxPlus.Rd
-db60d478e5f0d08ed9674c496f6f2c8b *src/Makevars
+c406581322a0d91e884b2b0fb852392b *src/Makevars
 20bc9034769db94a84f5c2c6ca769110 *src/Makevars.win
 f370d3aa5f024a99b712f648e30cc9f4 *src/coxReg.cpp
 87fd8c696b6cecb276fd5ef1c8ea3d52 *src/ldl.h
