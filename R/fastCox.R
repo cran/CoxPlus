@@ -4,7 +4,7 @@
 #' @description A high performance package estimating Proportional Hazards Model when an even can have more than one causes, including support for random and fixed effects, tied events, and time-varying variables.
 #' @param head A data frame with 4~5 columns: start, stop, event, weight, strata (optional).
 #' @param formula A formula specifying the independent variables
-#' @param par A list of parameters controlling the estimation process
+#' @param par A optional list of parameters controlling the estimation process
 #' @param data The dataset, a data frame containing observations on the independent variables
 #' @return A list containing the estimated parameters
 #' @export
@@ -15,7 +15,7 @@
 #' @useDynLib CoxPlus
 #' @examples
 #' # Simulate a dataset. lam=exp(x), suvtime depends on lam
-#' x = rnorm(1000)
+#' x = rnorm(5000)
 #' suvtime = -log(runif(length(x)))/exp(x)
 #' # Censor 80% of events
 #' thd = quantile(suvtime, 0.2)
@@ -24,10 +24,9 @@
 #'
 #' # The estimates of beta should be very close to 1, the true value
 #' head = cbind(start=0,stop=suvtime,event=event,weight=1)
-#' par = list(method=1, nEvents=sum(event))
-#' est = fastCox(head,~x,par)
+#' est = fastCox(head,~x)
 #' print(est$result)
-fastCox = function(head, formula, par, data=NULL){
+fastCox = function(head, formula, par=list(), data=NULL){
     # require(Rcpp)
     begin = Sys.time()
     # check on start and stop time
@@ -36,9 +35,14 @@ fastCox = function(head, formula, par, data=NULL){
         stop('Error: start time larger than or equal to stop time!!!')
     }
     # order, should be used on all vectors of length n in par!!!!
+    event_ix = head[,'event']>0
     if("strata" %in% colnames(head)) {
         ord = order(head[,'strata'], head[,'event'], head[,'stop'], head[,'start'], decreasing=T)
-    }else ord = order(head[,'event'], head[,'stop'], head[,'start'], decreasing=T)
+        nEvents = length(unique(paste(head[event_ix,'strata'], head[event_ix,'stop'])))
+    }else{
+        ord = order(head[,'event'], head[,'stop'], head[,'start'], decreasing=T)
+        nEvents = length(unique(head[event_ix, 'stop']))
+    }
     head = head[ord,]
     if(!is.null(par$sender)) par$sender=par$sender[ord]
     if(!is.null(par$receiver)) par$receiver=par$receiver[ord]
@@ -197,6 +201,7 @@ fastCox = function(head, formula, par, data=NULL){
     }
 
     # estimate
+    if(is.null(par$method)) par$method = 1
     mod=Rcpp::Module("cox_module", PACKAGE='CoxPlus')
     X = t(X)
     if(!is.null(par$isRandBeta) && par$isRandBeta) {
@@ -215,7 +220,7 @@ fastCox = function(head, formula, par, data=NULL){
         fit = inst$estimate()
     } else if (par$recursive %in% c("Twostage","TwostageMin","TwostageMax")){
         if(!is.null(par$delta) || !is.null(par$deltaType) ) writeLines("No need to specifiy delta and deltaType for two stage model.")
-        if(!is.null(par$method) && par$method!=3) writeLines("Forcing to use method 3 for two stage model")
+        if(par$method!=3) writeLines("Forcing to use method 3 for two stage model")
         par$delta = NULL
         par$deltaType=ifelse(par$recursive=="TwostageMin",-1,1)
         par$method=3
@@ -226,7 +231,7 @@ fastCox = function(head, formula, par, data=NULL){
         print("Done with two-stage estimation!")
     }else if (par$recursive=="Multistage"){
         if(!is.null(par$delta) || !is.null(par$deltaType) ) writeLines("No need to specifiy delta and deltaType for multi-stage model.")
-        if(!is.null(par$method) && par$method!=3) writeLines("Forcing to use method 3 for multi-stage model")
+        if(par$method!=3) writeLines("Forcing to use method 3 for multi-stage model")
         par$delta = NULL
         par$method=3
         if(!is.null(par$savePath)) save(head,X,par,file=par$savePath)
@@ -305,7 +310,12 @@ fastCox = function(head, formula, par, data=NULL){
 		if(par$nFixedGroups>=1) out$df = out$df + sum(par$fglen[1:par$nFixedGroups]-1) # Levels for each FE
     }
 	out$AIC = 2 * out$df - 2 * out$likelihood
-    out$BIC = log(par$nEvents) * out$df - 2 * out$likelihood
+	if(!is.null(par$nEvents) && par$nEvents!=nEvents){
+	    print('Provide nEvents and calculated nEvents do not match, will use provided')
+	    nEvents = par$nEvents
+	}
+    out$BIC = log(nEvents) * out$df - 2 * out$likelihood
+    out$nEvents = nEvents
 
 
     if(!is.null(fit$Vr)) out$Vr = fit$Vr

@@ -20,7 +20,7 @@ coxReg.cpp
 //#define ARMA_BLAS_CAPITALS
 #define ARMA_USE_BLAS
 #define ARMA_USE_LAPACK
-#define ARMA_64BIT_WORD
+//#define ARMA_64BIT_WORD
 // Use of BLAS and LAPACK and enabled by default, the above is for safety. Note that solve requires lapack
 //#define ARMA_DONT_USE_LAPACK
 //#define ARMA_DONT_USE_BLAS
@@ -33,7 +33,6 @@ coxReg.cpp
 #include <limits>
 #include <assert.h>
 #include <stdexcept>
-#include "ldl.h"
 //using namespace std;
 using namespace Rcpp;
 using namespace arma;
@@ -918,7 +917,7 @@ public:
 		int m = (int) v.n_elem;
 		mat res = zeros(m, m);
 		for (int i = 0; i < m; i++) {
-			if (abs(v[i]) > 1e-14) {
+			if (fabs(v[i]) > 1e-14) {
 				res.col(i) = v[i] * v;
 				res.row(i) = res.col(i).t();
 			}
@@ -1121,7 +1120,7 @@ public:
 							I += getVecOuter(Eq);
 							I -= Es * trans(Es);
 						}
-						if (abs(mean(wt) - 1) > 1e-14) I *= mean(wt);
+						if (fabs(mean(wt) - 1) > 1e-14) I *= mean(wt);
 						} else {
 							Rcout << "This tuned version only support method 2 (collective cause model) for now!" << endl;
 							throw std::invalid_argument( "This tuned version only support method 2 (collective cause model) for now!" );
@@ -1193,7 +1192,7 @@ public:
 					In = I;
 					Dn = D;
 					if(nf>0 && mean( abs( dbeta(span(0,p-1)) ) ) < 0.02 && eigPct > 1e-3 + 1e-6) {
-						eigPct /= sqrt(3);
+						eigPct /= sqrt(3.0);
 						Rcout << "Last successful step is too small. Reducing eigPct to " << eigPct << endl;
 					}
 				}
@@ -1265,7 +1264,7 @@ public:
 			V_conv = getInverse(I(span(0, p - 1), span(0, p - 1)));
 			se = zeros(p + nf);
 			se(span(0, p - 1)) = sqrt(diagvec(V_conv));
-			se(span(p, p + nf - 1)) = sqrt(1 / D);
+			se(span(p, p + nf - 1)) = sqrt(1.0 / D);
 			vec et = theta(span(randStarts, nf - 1));
 			double meanThetha = mean(et);
 			theta_se = 2 * meanThetha / (et.n_elem + sum(square(diagH22)) / (meanThetha * meanThetha) - 2 * sum(diagH22) / meanThetha );
@@ -1341,12 +1340,12 @@ public:
 				I.diag() += fmax(maxDiag * eigPct, -eigScalor * minDiag) * ones(I.n_cols);
 				if (!D.is_empty()) D += fmax(maxDiag * eigPct, -eigScalor * minDiag) * ones(D.n_elem);
 			}
+			superlu_opts settings;
+			settings.symmetric = true;
 			if (!D.is_empty()) {
-				ivec P = linspace<ivec>((int) U.n_elem - 1, 0, U.n_elem);
-				dbeta = CoxReg::solveSparse(genSPI(I, D), U, P);
+				dbeta = spsolve(genSPI(I, D), U, "superlu", settings);
 			} else if (nf > 0) {
-				ivec P = linspace<ivec>((int) U.n_elem - 1, 0, U.n_elem);
-				dbeta = CoxReg::solveSparse(sp_mat(I), U, P);
+				dbeta = spsolve(sp_mat(I), U, "superlu", settings);
 			} else dbeta = solve(I, U);
 		} catch (...) {
 			Rcout << "@@@ Caution: unalbe to fixed the exception by adding scalor to diagnoal of I, stop updating here!!!" << endl;
@@ -1386,60 +1385,6 @@ public:
 		if (isCheckFixedEffect && !validFrailty.is_empty()) inv(validFrailty, validFrailty) = tmp;
 		else inv = tmp;
 		return inv;
-	}
-
-	/* solve Ax=b, A must be symmetric!!!
-	 * only the upper triangular part of A is required
-	 * but all entries of A should be provided when using the permutation input P of length N */
-	static vec solveSparse(sp_mat m, vec b, ivec P) {
-		LDL_int N = (LDL_int) m.n_rows;
-		//printf("Sparsity level of m=%g\n", (double) m.n_nonzero / (N * N));
-		LDL_int* Pinv = new LDL_int[N];
-		LDL_int* Lp = new LDL_int[N + 1];
-		LDL_int* Parent = new LDL_int[N];
-		LDL_int* Lnz = new LDL_int[N];
-		LDL_int* Flag = new LDL_int[N];
-
-		LDL_uint* Ap = m.col_ptrs; // pointing to constant data (modification forbidden)
-		LDL_uint* Ai = m.row_indices;
-		const double* Ax = m.values;
-
-		LDL_symbolic(N, Ap, Ai, Lp, Parent, Lnz, Flag, P.memptr(), Pinv);
-		//printf("Sparsity level of L=%g, nonzeros excluding diagonal=%d\n", (Lp[N] + N) / (double) LNZ, Lp[N]);
-
-		LDL_int LNZ = Lp[N]; // Number of nonzeros below the diagonal of L
-		LDL_int* Li = new LDL_int[LNZ];
-		double* Lx = new double[LNZ];
-		double* D = new double[N];
-		double* Y = new double[N];
-		LDL_int* Pattern = new LDL_int[N];
-		vec x = zeros(N); // save result
-
-		LDL_int d = LDL_numeric(N, Ap, Ai, Ax, Lp, Parent, Lnz, Li, Lx, D, Y, Pattern, Flag, P.memptr(), Pinv);
-
-		if (d == N) {
-			LDL_perm(N, Y, b.memptr(), P.memptr());
-			LDL_lsolve(N, Y, Lp, Li, Lx);
-			LDL_dsolve(N, Y, D);
-			LDL_ltsolve(N, Y, Lp, Li, Lx);
-			LDL_permt(N, x.memptr(), Y, P.memptr());
-		} else {
-			Rcout << "ldl_numeric failed, D (" << d << "," << d << ") is zero" << endl;
-			throw;
-		}
-
-		delete [] Pinv;
-		delete [] Li;
-		delete [] Lp;
-		delete [] Parent;
-		delete [] Lnz;
-		delete [] Flag;
-		delete [] Pattern;
-
-		delete [] Lx;
-		delete [] D;
-		delete [] Y;
-		return x;
 	}
 
 	void printDeltaType() {

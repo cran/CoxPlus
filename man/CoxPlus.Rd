@@ -7,14 +7,14 @@
 \alias{fastCox}
 \title{Cox Regression (Proportional Hazards Model) with Multiple Causes and Mixed Effects}
 \usage{
-fastCox(head, formula, par, data = NULL)
+fastCox(head, formula, par = list(), data = NULL)
 }
 \arguments{
 \item{head}{A data frame with 4~5 columns: start, stop, event, weight, strata (optional).}
 
 \item{formula}{A formula specifying the independent variables}
 
-\item{par}{A list of parameters controlling the estimation process}
+\item{par}{A optional list of parameters controlling the estimation process}
 
 \item{data}{The dataset, a data frame containing observations on the independent variables}
 }
@@ -26,7 +26,7 @@ A high performance package estimating Proportional Hazards Model when an even ca
 }
 \examples{
 # Simulate a dataset. lam=exp(x), suvtime depends on lam
-x = rnorm(1000)
+x = rnorm(5000)
 suvtime = -log(runif(length(x)))/exp(x)
 # Censor 80\% of events
 thd = quantile(suvtime, 0.2)
@@ -35,8 +35,7 @@ suvtime[suvtime>thd] = thd
 
 # The estimates of beta should be very close to 1, the true value
 head = cbind(start=0,stop=suvtime,event=event,weight=1)
-par = list(method=1, nEvents=sum(event))
-est = fastCox(head,~x,par)
+est = fastCox(head,~x)
 print(est$result)
 }
 
