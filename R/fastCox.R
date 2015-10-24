@@ -26,6 +26,8 @@
 #' head = cbind(start=0,stop=suvtime,event=event,weight=1)
 #' est = fastCox(head,~x)
 #' print(est$result)
+#' @references 1. Jing Peng, Ashish Agarwal, Kartik Hosanagar, and Raghuram Iyengar. Towards Effective Information Diffusion on Social Media Platforms: A Dyadic Analysis of Network Embeddedness. Working Paper.
+#' @references 2. Jing Peng, Ashish Agarwal, Kartik Hosanagar, and Raghuram Iyengar. Toward Effective Social Contagion: A Micro Level Analysis of the Impact of Dyadic Network Relationship. In Proceedings of the 2014 International Conference on Information Systems.
 fastCox = function(head, formula, par=list(), data=NULL){
     # require(Rcpp)
     begin = Sys.time()
