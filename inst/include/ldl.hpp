@@ -154,8 +154,12 @@
  * the README file for the License.
  */
 
-#define LDL_int long long int
-#define LDL_uint const unsigned long long int
+#define LDL_int int
+#define LDL_uint const unsigned int
+
+// *** For Linux on Grid, before 1.4.4 may need something different ***
+// #define LDL_int long long int
+// #define LDL_uint const long long unsigned int
 
 /* ========================================================================== */
 /* === ldl_symbolic ========================================================= */

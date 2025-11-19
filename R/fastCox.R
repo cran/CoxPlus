@@ -1,20 +1,18 @@
+if (getRversion() >= "2.15.1") {
+    utils::globalVariables(c("eventOrder", "lower", "upper", "."))
+}
+
 #' Cox Regression (Proportional Hazards Model) with Multiple Causes and Mixed Effects
-#' @docType package
-#' @name CoxPlus
-#' @description A high performance package estimating Proportional Hazards Model when an even can have more than one causes, including support for random and fixed effects, tied events, and time-varying variables.
+#' @description This function estimates Proportional Hazards Model when an even can have more than one causes, including support for random and fixed effects, tied events, and time-varying variables.
 #' @param head A data frame with 4~5 columns: start, stop, event, weight, strata (optional).
 #' @param formula A formula specifying the independent variables
 #' @param par A optional list of parameters controlling the estimation process
 #' @param data The dataset, a data frame containing observations on the independent variables
 #' @return A list containing the estimated parameters
 #' @export
-#' @importFrom Rcpp evalCpp Module initialize cpp_object_initializer
-#' @importFrom stats model.matrix rnorm pchisq
-#' @importFrom utils tail
-#' @importFrom methods new
-#' @useDynLib CoxPlus
 #' @examples
 #' # Simulate a dataset. lam=exp(x), suvtime depends on lam
+#' set.seed(123)
 #' x = rnorm(5000)
 #' suvtime = -log(runif(length(x)))/exp(x)
 #' # Censor 80% of events
@@ -26,12 +24,13 @@
 #' head = cbind(start=0,stop=suvtime,event=event,weight=1)
 #' est = fastCox(head,~x)
 #' print(est$result)
-#' @references 1. Jing Peng, Ashish Agarwal, Kartik Hosanagar, and Raghuram Iyengar. Towards Effective Information Diffusion on Social Media Platforms: A Dyadic Analysis of Network Embeddedness. Working Paper.
+#' @references 1. Jing Peng, Ashish Agarwal, Kartik Hosanagar, and Raghuram Iyengar. (2018). Network Overlap and Content Sharing on Social Media Platforms. Journal of Marketing Research, 55(4), p. 571-585.
 #' @references 2. Jing Peng, Ashish Agarwal, Kartik Hosanagar, and Raghuram Iyengar. Toward Effective Social Contagion: A Micro Level Analysis of the Impact of Dyadic Network Relationship. In Proceedings of the 2014 International Conference on Information Systems.
 fastCox = function(head, formula, par=list(), data=NULL){
     # require(Rcpp)
     begin = Sys.time()
     # check on start and stop time
+    head = data.frame(head)
     if(any(head[,'start']>=head[,'stop'])){
         print(head[head[,'start']>=head[,'stop'],])
         stop('Error: start time larger than or equal to stop time!!!')
@@ -39,12 +38,14 @@ fastCox = function(head, formula, par=list(), data=NULL){
     # order, should be used on all vectors of length n in par!!!!
     event_ix = head[,'event']>0
     if("strata" %in% colnames(head)) {
-        ord = order(head[,'strata'], head[,'event'], head[,'stop'], head[,'start'], decreasing=T)
+        ord = order(head[,'strata'], head[,'event'], head[,'stop']-min(head[,'stop']), head[,'start']-median(head[,'start']), decreasing=T)
         nEvents = length(unique(paste(head[event_ix,'strata'], head[event_ix,'stop'])))
     }else{
-        ord = order(head[,'event'], head[,'stop'], head[,'start'], decreasing=T)
+        ord = order(head[,'event'], head[,'stop']-min(head[,'stop']), head[,'start']-median(head[,'start']), decreasing=T)
         nEvents = length(unique(head[event_ix, 'stop']))
     }
+    # do not sort if already sorted: in case of unstable sorts
+    if(!is.null(par$isSorted) && par$isSorted) ord = 1:nrow(head)
     head = head[ord,]
     if(!is.null(par$sender)) par$sender=par$sender[ord]
     if(!is.null(par$receiver)) par$receiver=par$receiver[ord]
@@ -159,18 +160,35 @@ fastCox = function(head, formula, par=list(), data=NULL){
     ix = 1:ncol(X)
     names(ix) = fnames
     if(!is.null(par$fixedCol)) par$fixedCoefIndex = ix[par$fixedCol] - 1
-    if(!is.null(par$timeVarCols) && length(intersect(par$timeVarCols,fnames))>0){
-        par$timeVarCols = intersect(par$timeVarCols,fnames)
-        par$timeVarIndex = ix[par$timeVarCols] -1
-        # print(par$timeVarIndex)
-        if("age" %in% par$timeVarCols) par$ageIndex=which(par$timeVarCols=="age")-1
-        if("logDiggNum" %in% par$timeVarCols) par$diggNumIndex=which(par$timeVarCols=="logDiggNum")-1
+    if(!is.null(par$vX)){
+        if(!identical(ord, 1:length(ord))) stop('Causion: data should NOT be reordered in TV version')
+        if(!'eventOrder' %in% colnames(head)) stop('Event order needed in head to deal with time varying variables')
+        vX = data.table(par$vX)
+        # format of vX: eventOrder, vXs
+        timeVarCols = intersect(colnames(vX)[-1],fnames)
+        if(length(timeVarCols)<ncol(vX)-1) {
+            writeLines('The following variables in vX will not be used because they are not included in regressors')
+            print(setdiff(colnames(vX)[-1], timeVarCols))
+        }
+        par$timeVarIndex = ix[timeVarCols] - 1
+        # retrieve values of time varying variables at each event in the data
+        # assume vX already sorted over strata, stop, and start, in the same way as head
+        eventOrders = sort(unique(head[head[,'event']==1,'eventOrder']))
+        if(length(eventOrders)<1) stop('Less than 1 event order in the data')
+
+        vX$ix = 1:nrow(vX)
+        bound_ix = vX[, list(lower=min(ix), upper=max(ix)), by='eventOrder']
+        setkey(bound_ix, eventOrder)
+        par$tvs = as.matrix(bound_ix[.(eventOrders), list(lower,upper)]) - 1
+        par$vX = as.matrix(t(vX[, timeVarCols, with=F]))
+
+
         # construction a map for interaction terms
         subnames = strsplit(fnames, split=":")
         nInteractions = 0
         for(i in 1:ncol(X)){
             snames = unlist(subnames[i])
-            if(length(snames)>1 && any(snames %in% par$timeVarCols)){
+            if(length(snames)>1 && any(snames %in% timeVarCols)){
                 nInteractions = nInteractions+1
             }
         }
@@ -179,7 +197,7 @@ fastCox = function(head, formula, par=list(), data=NULL){
         j = 1
         for(i in 1:ncol(X)){
             snames = unlist(subnames[i])
-            if(length(snames)>1 && any(snames %in% par$timeVarCols)){
+            if(length(snames)>1 && any(snames %in% timeVarCols)){
                 interMap[j,] = c(i, ix[snames]) - 1
                 j = j+1
             }
@@ -224,13 +242,15 @@ fastCox = function(head, formula, par=list(), data=NULL){
         if(!is.null(par$delta) || !is.null(par$deltaType) ) writeLines("No need to specifiy delta and deltaType for two stage model.")
         if(par$method!=3) writeLines("Forcing to use method 3 for two stage model")
         par$delta = NULL
-        par$deltaType=ifelse(par$recursive=="TwostageMin",-1,1)
+        par$deltaType = 0
+        if(par$recursive=="TwostageMin") par$deltaType = -1
+        if(par$recursive=="TwostageMax") par$deltaType = 1
         par$method=3
         if(!is.null(par$savePath)) save(head,X,par,file=par$savePath)
         inst = new(mod$CoxReg,head,X,par)
         fit = inst$estimate()
         fit = inst$estimate()
-        print("Done with two-stage estimation!")
+        print(paste0("Done with ", par$recursive, " estimation!"))
     }else if (par$recursive=="Multistage"){
         if(!is.null(par$delta) || !is.null(par$deltaType) ) writeLines("No need to specifiy delta and deltaType for multi-stage model.")
         if(par$method!=3) writeLines("Forcing to use method 3 for multi-stage model")
@@ -249,8 +269,7 @@ fastCox = function(head, formula, par=list(), data=NULL){
             # The two-stage speed up method may have a reversed interpretation where the likelihood decreases until compatible with the model
             # starting with equal weight is a good idea because it is compatible with beta=0
             if(is.null(par$isEnableSpeedup)) par$isEnableSpeedup=0
-            if(par$isEnableSpeedup==1){ inst$deltaType = ifelse(iter==2,1,0) }
-            else{ inst$deltaType = 0 }
+            inst$deltaType = ifelse(iter==2 && par$isEnableSpeedup==1,1,0)
             fit = inst$estimate()
             Lc = fit$likelihood
             # The first two rounds for initializing beta if speedup
@@ -322,6 +341,9 @@ fastCox = function(head, formula, par=list(), data=NULL){
 
     if(!is.null(fit$Vr)) out$Vr = fit$Vr
     if(!is.null(fit$theta)) out$theta = fit$theta
+    if(!is.null(par$predict) && par$predict==T){
+        out$xbeta = c(t(X) %*% beta)[order(ord)]
+    }
     print(Sys.time() - begin)
     rm(X, head, par, fit, inst, mod)
     out

@@ -1,26 +1,11 @@
-/*
-coxReg.cpp
- * To do List
- * 1) Warning: May need to zero S1, S2, and riskset if the code is modified later on
- * 2) Singularity protection while inv or solve: maybe pivoting. read source code for inv and solve. Consequence, robust wald is not accurate.
- * Example, two id data used, results are different,all id are the same
- * 3) Double check potential errors (e.g., score residual split, grouping, how to choose delta_i, connection to EM)
- * 7) Remove NA in beta and I, which.sing= diag(v). Check singularity while inv or solve
- * 8) Template programming for transformation, Event to Integer vector
- * 9) Test statistics for frailty models and df computation (maybe not integer)
- * 10) For Rcpp and Armadillo, You cannot use multiple indices in a single [ ] expression!!!, use \[[^\]]+,.*?\] to find out all such wrong usage like [i,j]
- * 11) Armadillo can't save unsigned type like uvec
- * 12) Theta is hard to estimate as L is not sensitive to theta (too small in L)
- *
-
- */
 #if !defined(DEBUG_MODE)
 	#define ARMA_NO_DEBUG
 #endif
 //#define ARMA_BLAS_CAPITALS
 #define ARMA_USE_BLAS
 #define ARMA_USE_LAPACK
-//#define ARMA_64BIT_WORD
+#define ARMA_USE_ARPACK
+#define ARMA_USE_NEWARP // use built-in arpark
 // Use of BLAS and LAPACK and enabled by default, the above is for safety. Note that solve requires lapack
 //#define ARMA_DONT_USE_LAPACK
 //#define ARMA_DONT_USE_BLAS
@@ -32,6 +17,7 @@ coxReg.cpp
 #include <fstream>
 #include <limits>
 #include <assert.h>
+#include <ldl.hpp>
 #include <stdexcept>
 //using namespace std;
 using namespace Rcpp;
@@ -60,22 +46,23 @@ class CoxReg {
 	int isREML;
 	int isCutBeta;
 	int isCutStep;
-	int isUpdateDiggNum; // useful for comparison with SAS only
 	int isTieGroup;
 	int maxStepHalving;
 	int fixedCoefIndex;
-	int ageIndex; // index of age in timeVarIndex
-	int diggNumIndex; // index of diggNum in timeVarIndex
-	int isAbsoluteAge; // time or time-imprtime
 	int isFixedEffect; // fixed effect (1), random effect (-1), both (0)
 	int randStarts; //starting from this (theta) group, it will be random effect
 	int isDiagFrailty;
 	int isForceCheck;
 	int isDebug; // only save data when debug enabled
+	int isMeanVX; // whether to mean center time varying variables such as popularity
 
 	int nThetaGroups; // number of theta groups
 	ivec dropFlag;
 	ivec timeVarIndex;
+	umat tvs; // store begin and end indices for vX
+	ivec selected_events; // to skip certained occured events (e.g., based on popularity)
+	mat vX; // time varying variables at different time points
+	vec avgVX; //row average
 	uvec keepIndex;
 	vec offset;
 	vec delta; // not used if beta_last is given
@@ -83,7 +70,7 @@ class CoxReg {
 	uvec validFrailty; //For each fixed effect, one degree of freedom needs to be disabled
 	double fixedCoef;
 	double eigScalor;
-	double eigPct;
+	double eigPct, eigPct_bak;
 	double minstop, maxstop; // an alternative way for censoring
 
 	//Results
@@ -145,18 +132,14 @@ public:
 		par[8] = isREML;
 		par[9] = isCutBeta;
 		par[10] = isCutStep;
-		par[11] = isUpdateDiggNum;
-		par[12] = isTieGroup;
-		par[13] = maxStepHalving;
-		par[14] = fixedCoefIndex;
-		par[15] = ageIndex;
-		par[16] = diggNumIndex;
-		par[17] = isAbsoluteAge;
-		par[18] = isFixedEffect;
-		par[19] = randStarts;
-		par[20] = nThetaGroups;
-		par[21] = isDiagFrailty;
-		par[22] = isForceCheck;
+		par[11] = isTieGroup;
+		par[12] = maxStepHalving;
+		par[13] = fixedCoefIndex;
+		par[14] = isFixedEffect;
+		par[15] = randStarts;
+		par[16] = nThetaGroups;
+		par[17] = isDiagFrailty;
+		par[18] = isForceCheck;
 		par.save("save/par.mat");
 
 		if (!dropFlag.is_empty()) dropFlag.save("save/dropFlag.mat");
@@ -215,18 +198,14 @@ public:
 		isREML = par[8];
 		isCutBeta = par[9];
 		isCutStep = par[10];
-		isUpdateDiggNum = par[11];
-		isTieGroup = par[12];
-		maxStepHalving = par[13];
-		fixedCoefIndex = par[14];
-		ageIndex = par[15];
-		diggNumIndex = par[16];
-		isAbsoluteAge = par[17];
-		isFixedEffect = par[18];
-		randStarts = par[19];
-		nThetaGroups = par[20];
-		isDiagFrailty = par[21];
-		isForceCheck = par[22];
+		isTieGroup = par[11];
+		maxStepHalving = par[12];
+		fixedCoefIndex = par[13];
+		isFixedEffect = par[14];
+		randStarts = par[15];
+		nThetaGroups = par[16];
+		isDiagFrailty = par[17];
+		isForceCheck = par[18];
 
 		if (exist(path + "dropFlag.mat")) dropFlag.load(path + "dropFlag.mat");
 		if (exist(path + "timeVarIndex.mat")) timeVarIndex.load(path + "timeVarIndex.mat");
@@ -312,24 +291,29 @@ public:
 		deltaType = (par.containsElementNamed("deltaType")) ? as<int> (par["deltaType"]) : 0;
 		isCutBeta = (par.containsElementNamed("isCutBeta")) ? as<int> (par["isCutBeta"]) : 0;
 		isCutStep = (par.containsElementNamed("isCutStep")) ? as<int> (par["isCutStep"]) : 0;
-		isAbsoluteAge = (par.containsElementNamed("isAbsoluteAge")) ? as<int> (par["isAbsoluteAge"]) : 1;
-		isUpdateDiggNum = (par.containsElementNamed("isUpdateDiggNum")) ? as<int> (par["isUpdateDiggNum"]) : 1;
-		ageIndex = (par.containsElementNamed("ageIndex")) ? as<int> (par["ageIndex"]) : -1;
-		diggNumIndex = (par.containsElementNamed("diggNumIndex")) ? as<int> (par["diggNumIndex"]) : -1;
 		isTieGroup = (par.containsElementNamed("isTieGroup")) ? as<int> (par["isTieGroup"]) : 0;
 		maxStepHalving = (par.containsElementNamed("maxStepHalving")) ? as<int> (par["maxStepHalving"]) : 10;
 		fixedCoefIndex = (par.containsElementNamed("fixedCoefIndex")) ? as<int> (par["fixedCoefIndex"]) : -1;
 		fixedCoef = (par.containsElementNamed("fixedCoef")) ? as<double> (par["fixedCoef"]) : 0;
 		isForceCheck = (par.containsElementNamed("isForceCheck")) ? as<int> (par["isForceCheck"]) : 0;
 		if (par.containsElementNamed("dropFlag")) dropFlag = int2ivec(as<IntegerVector> (par["dropFlag"]));
-		if (par.containsElementNamed("timeVarIndex")) timeVarIndex = int2ivec(as<IntegerVector> (par["timeVarIndex"]));
-		if (par.containsElementNamed("interMap")) interMap = int2imat(as<IntegerMatrix> (par["interMap"]));
+		if (par.containsElementNamed("timeVarIndex")) {
+			timeVarIndex = int2ivec(as<IntegerVector> (par["timeVarIndex"]));
+			tvs = conv_to<umat>::from(int2imat(as<IntegerMatrix> (par["tvs"])));
+			if (par.containsElementNamed("selected_events"))
+			    selected_events = int2ivec(as<IntegerVector> (par["selected_events"]));
+			vX = num2mat(as<NumericMatrix>(par["vX"]));
+			avgVX = mean(vX, 1);
+			if (par.containsElementNamed("interMap")) interMap = int2imat(as<IntegerMatrix> (par["interMap"]));
+			isMeanVX = (par.containsElementNamed("meanVX")) ? as<int> (par["meanVX"]) : 0;
+		}
 		if (par.containsElementNamed("offset")) offset = num2vec(as<NumericVector> (par["offset"]));
-		eps = (par.containsElementNamed("eps")) ? as<double> (par["eps"]) : 1e-9; // The maximal distinguishable difference is around 1e-15
+		eps = (par.containsElementNamed("eps")) ? as<double> (par["eps"]) : 1e-6; // The maximal distinguishable difference is around 1e-15
 		tol = (par.containsElementNamed("tol")) ? as<double> (par["tol"]) : 1e-6;
 		tol_par = (par.containsElementNamed("tol_par")) ? as<double> (par["tol_par"]) : 1e-4;
-		eigScalor = (par.containsElementNamed("eigScalor")) ? as<double> (par["eigScalor"]) : 2;
+		eigScalor = (par.containsElementNamed("eigScalor")) ? as<double> (par["eigScalor"]) : 1.2;
 		eigPct = (par.containsElementNamed("eigPct")) ? as<double> (par["eigPct"]) : 1e-2;
+		eigPct_bak = eigPct;
 		minstop = (par.containsElementNamed("minstop")) ? as<double> (par["minstop"]) : -DBL_MAX;
 		maxstop = (par.containsElementNamed("maxstop")) ? as<double> (par["maxstop"]) : DBL_MAX;
 		p = X.n_rows;
@@ -421,6 +405,33 @@ public:
 		return e;
 	}
 
+	inline void updateTimeVarying(mat &m, int s, int nEvents){
+		if (timeVarIndex.is_empty()) return;
+		uvec block = tvs.row(nEvents-1);
+		int begin = strataBounds(s, 0);
+		int end = strataBounds(s, 1);
+		if((int)(block[1]-block[0]) != end-begin){
+			Rcout<<"Time varying obs doesn't match, blocks: " << block[0] << "," << block[1]
+				<< ", original data col bounds: " << begin << "," << end << endl;
+			Rcout << "s: " << s << ", nEvents: " << nEvents << endl;
+			throw std::invalid_argument( "Error while updating time varying variables!" );
+		}
+// 		if(nEvents<=10){
+// 		    Rcout<<"Blocks: " << block[0] << "," << block[1]
+//           << ", original data col bounds: " << begin << "," << end << endl;
+// 		    Rcout << "s: " << s << ", nEvents: " << nEvents << endl;
+// 		}
+		mat replace = vX.cols(block[0],block[1]);
+		if(isMeanVX==1){
+		    for(int i=0; i < (int) replace.n_rows; i++) replace.row(i) -= avgVX[i];
+		    // Rcout << "Population mean retweetNum: " << mean(vX.row(0)) << endl;
+		    // Rcout << "Tweet mean retweetNum: " << mean(replace.row(0)) << endl;
+		}
+		m(conv_to<uvec>::from(timeVarIndex), linspace<uvec> (begin, end, end-begin+1)) = replace;
+		for (uword a = 0; a < interMap.n_rows; a++)
+			m(interMap(a, 0), span(begin,end)) = m(interMap(a, 1), span(begin,end)) % m(interMap(a, 2), span(begin,end));
+	}
+
 	void estimateNormal() {
 		converged = 0;
 		double Ln = -DBL_MAX;
@@ -445,15 +456,18 @@ public:
 			E = 0;
 			U = zeros(p);
 			I = zeros(p, p);
+			int nEvents = 0;
 			for (int s = 0; s < (int) (strataBounds.n_rows); s++) {
 				// Traverse events within a strata
 				for (int i = strataBounds(s, 0); i <= strataBounds(s, 1); i++) {
 					if (event[i] == 0) break;
+					nEvents++;
+					updateTimeVarying(X, s, nEvents);
 					time = stop[i];
 					if(time<minstop - eps) continue;
 					if(time>maxstop + eps) break;
-					time_lb = time * (1 - eps); // numerical underflow may cause problem; that happens, change the inequality below
-					time_ub = time * (1 + eps);
+					time_lb = time - eps; // numerical underflow may cause problem; that happens, change the inequality below
+					time_ub = time + eps;
 					nrisk = 0;
 					ntied = 0;
 					for (int j = i; j <= strataBounds(s, 1); j++) {
@@ -470,25 +484,16 @@ public:
 						throw std::invalid_argument( "Logical error: ntied<=0!" );
 					}
 					i += ntied - 1;
+					// skip if identified event not selected
+					if(!selected_events.is_empty() && all(selected_events!=nEvents)) continue;
 					// Update X
 					uvec v = uvec(riskset, nrisk, false, true);
 					vec wr = weight(v);
 					vec wt = wr(span(0, ntied - 1));
 					mat Xr = X.cols(v);
-					// Deal with time-varying variables: Digg number and time, if subtracting mean before interaction, the results may be different with SAS
-					if (!timeVarIndex.is_empty()) {
-						if (ageIndex >= 0) {
-							if (isAbsoluteAge == 1) Xr.row(timeVarIndex[ageIndex]).fill(time / 86400.0);
-							else Xr.row(timeVarIndex[ageIndex]) = (time - Xr.row(timeVarIndex[ageIndex])) / 86400.0;
-						}
-						if (diggNumIndex >= 0 && isUpdateDiggNum == 1) {
-							Xr.row(timeVarIndex[diggNumIndex]).fill(X(timeVarIndex[diggNumIndex], i - ntied + 1));
-						}
-						for (a = 0; (uword) a < interMap.n_rows; a++) Xr.row(interMap(a, 0)) = Xr.row(interMap(a, 1)) % Xr.row(interMap(a, 2));
-					}
 					if (fixedCoefIndex >= 0) fixedCoefOffset = fixedCoef * Xr.row(fixedCoefIndex);
 					if (!dropFlag.is_empty()) Xr = Xr.rows(keepIndex);
-					centerX(Xr);
+					centerX(Xr); //commented out for the purpose of test
 					mat tXr = trans(Xr);
 					mat Xt = Xr.cols(0, ntied - 1);
 					// compute XB, eXB, Q, Q1,Q2, S,S1,S2,Eq,Es
@@ -523,8 +528,8 @@ public:
 					if (method == 2) { // collective cause
 						// assume weights for tied obs are the same, use mean in case not equal by mistake
 						L += mean(wt) * (log(Q) - log(S));
-					U += mean(wt)*(Eq - Es);
-					I += mean(wt) *(S2 / S - Q2 / Q + Eq * trans(Eq) - Es * trans(Es));
+						U += mean(wt)*(Eq - Es);
+						I += mean(wt) *(S2 / S - Q2 / Q + Eq * trans(Eq) - Es * trans(Es));
 					} else if (method == 0) { // Breslow
 						L += dot(wt, xbeta(span(0, ntied - 1))) - sum(wt) * log(S);
 						U += vec(Xt * wt) - Es * sum(wt);
@@ -545,16 +550,19 @@ public:
 					} else if (method == 3) { // Single cause
 						vec dt = ones(ntied) / (double) ntied;
 						if (!beta_last.is_empty()) {
+						    // Note: delta is calculated using beta_last, which is updated after convergence of beta
 							vec delta_est = zeros(ntied);
 							vec xbeta_est = vec(trans(Xt) * beta_last);
 							if (!offset.is_empty()) xbeta_est += offset(v(span(0, ntied - 1)));
 							if (fixedCoefIndex >= 0) xbeta_est += fixedCoefOffset(span(0, ntied - 1));
 							uword index;
 							if (deltaType == 1) {
-								xbeta_est.max(index);
+							    index = xbeta_est.index_max();
+								//xbeta_est.max(index);
 								delta_est[index] = 1;
 							} else if (deltaType == -1) {
-								xbeta_est.min(index);
+							    index = xbeta_est.index_min();
+								//xbeta_est.min(index);
 								delta_est[index] = 1;
 							} else if (deltaType == 0) {
 								vec exp_xbeta_est = exp(xbeta_est - max(xbeta_est));
@@ -566,6 +574,7 @@ public:
 						E += getEntropy(dt);
 						L += getEntropy(dt);
 						L += dot(wt, xbeta(span(0, ntied - 1))) - sum(wt) * log(S);
+						// Note: ignore the KL divergence in Equation 9.70 (Bishop p 450), which is 0 upon convergence
 						U += vec(Xt * wt) - Es * sum(wt);
 						I += sum(wt) *(S2 / S - Es * trans(Es));
 					}
@@ -655,6 +664,7 @@ public:
 		int ntied = 0;
 		double time, time_lb, time_ub;
 		vec fixedCoefOffset;
+		int nEvents = 0;
 		// Strata by strata, data ordered by -strata, event, stop, and start in descending order
 		for (int s = 0; s < (int) (strataBounds.n_rows); s++) {
 			// count number of events
@@ -666,9 +676,11 @@ public:
 			// Traverse events within a strata
 			for (int i = strataBounds(s, 0); i <= strataBounds(s, 1); i++) {
 				if (event[i] == 0) break;
+				nEvents++;
+				updateTimeVarying(X, s, nEvents);
 				time = stop[i];
-				time_lb = time * (1 - eps); // numerical underflow may cause problem; that happens, change the inequality below
-				time_ub = time * (1 + eps);
+				time_lb = time - eps; // numerical underflow may cause problem; that happens, change the inequality below
+				time_ub = time + eps;
 				nrisk = 0;
 				ntied = 0;
 				for (int j = i; j <= strataBounds(s, 1); j++) {
@@ -682,22 +694,13 @@ public:
 					throw std::invalid_argument( "Logical error: ntied<=0!" );
 				}
 				i += ntied - 1;
+				// skip if identified event not selected
+				if(!selected_events.is_empty() && all(selected_events!=nEvents)) continue;
 				// Update X
 				uvec v = uvec(riskset, nrisk, false, true);
 				vec wr = weight(v);
 				vec wt = wr(span(0, ntied - 1));
 				mat Xr = X.cols(v);
-				// Deal with time-varying variables: Digg number and time, if subtracting mean before interaction, the results may be different with SAS
-				if (!timeVarIndex.is_empty()) {
-					if (ageIndex >= 0) {
-						if (isAbsoluteAge == 1) Xr.row(timeVarIndex[ageIndex]).fill(time / 86400.0);
-						else Xr.row(timeVarIndex[ageIndex]) = (time - Xr.row(timeVarIndex[ageIndex])) / 86400.0;
-					}
-					if (diggNumIndex >= 0 && isUpdateDiggNum == 1) {
-						Xr.row(timeVarIndex[diggNumIndex]).fill(X(timeVarIndex[diggNumIndex], i - ntied + 1));
-					}
-					for (int a = 0; (uword) a < interMap.n_rows; a++) Xr.row(interMap(a, 0)) = Xr.row(interMap(a, 1)) % Xr.row(interMap(a, 2));
-				}
 				if (fixedCoefIndex >= 0) fixedCoefOffset = fixedCoef * Xr.row(fixedCoefIndex);
 				if (!dropFlag.is_empty()) Xr = Xr.rows(keepIndex);
 				centerX(Xr);
@@ -751,18 +754,20 @@ public:
 		double time, time_lb, time_ub;
 		int k, d, j;
 		double tmp;
-		int a;
 		uvec tiegroup = zeros<uvec>(n);
 		int tieID = 0;
 		vec fixedCoefOffset;
+		int nEvents = 0;
 		// Strata by strata, data ordered by -strata, event, stop, and start in descending order
 		for (int s = 0; s < (int) (strataBounds.n_rows); s++) {
 			// Traverse events within a strata
 			for (int i = strataBounds(s, 0); i <= strataBounds(s, 1); i++) {
 				if (event[i] == 0) break;
+				nEvents++;
+				updateTimeVarying(X, s, nEvents);
 				time = stop[i];
-				time_lb = time * (1 - eps);
-				time_ub = time * (1 + eps);
+				time_lb = time - eps; // numerical underflow may cause problem; that happens, change the inequality below
+				time_ub = time + eps;
 				nrisk = 0;
 				ntied = 0;
 				for (j = i; j <= strataBounds(s, 1); j++) {
@@ -779,22 +784,13 @@ public:
 				//                Rcout << i << "," << ntied << "," << tieID << "\n";
 				tieID++;
 				i += ntied - 1;
+				// skip if identified event not selected
+				if(!selected_events.is_empty() && all(selected_events!=nEvents)) continue;
 				// Update X
 				uvec v = uvec(riskset, nrisk, false, true);
 				vec wr = weight(v);
 				vec wt = wr(span(0, ntied - 1));
 				mat Xr = X.cols(v);
-				// Deal with time-varying variables: Digg number and time, if subtracting mean before interaction, the results may be different with SAS
-				if (!timeVarIndex.is_empty()) {
-					if (ageIndex >= 0) {
-						if (isAbsoluteAge == 1) Xr.row(timeVarIndex[ageIndex]).fill(time / 86400.0);
-						else Xr.row(timeVarIndex[ageIndex]) = (time - Xr.row(timeVarIndex[ageIndex])) / 86400.0;
-					}
-					if (diggNumIndex >= 0 && isUpdateDiggNum == 1) {
-						Xr.row(timeVarIndex[diggNumIndex]).fill(X(timeVarIndex[diggNumIndex], i - ntied + 1));
-					}
-					for (a = 0; (uword) a < interMap.n_rows; a++) Xr.row(interMap(a, 0)) = Xr.row(interMap(a, 1)) % Xr.row(interMap(a, 2));
-				}
 				if (fixedCoefIndex >= 0) fixedCoefOffset = fixedCoef * Xr.row(fixedCoefIndex);
 				if (!dropFlag.is_empty()) Xr = Xr.rows(keepIndex);
 				centerX(Xr);
@@ -850,10 +846,12 @@ public:
 						if (fixedCoefIndex >= 0) xbeta_est += fixedCoefOffset(span(0, ntied - 1));
 						uword index;
 						if (deltaType == 1) {
-							xbeta_est.max(index);
+						    index = xbeta_est.index_max();
+							//xbeta_est.max(index);
 							delta_est[index] = 1;
 						} else if (deltaType == -1) {
-							xbeta_est.min(index);
+						    index = xbeta_est.index_min();
+							//xbeta_est.min(index);
 							delta_est[index] = 1;
 						} else if (deltaType == 0) {
 							vec exp_xbeta_est = exp(xbeta_est - max(xbeta_est));
@@ -946,9 +944,9 @@ public:
 		vec betaOld = beta;
 		vec thetaOld = theta;
 		vec Un;
-		mat I = zeros(p + nf, (isDiagFrailty == 1) ? p : (p + nf));
+		I = zeros(p + nf, (isDiagFrailty == 1) ? p : (p + nf));
 		mat In;
-		vec D, Dn; // diag of frailty
+		vec D, Dn; // diag of frailty. name conficts with global mat D
 		vec diagH22;
 		mat H22;
 		vec S1 = zeros(p + nf);
@@ -970,16 +968,19 @@ public:
 				I.zeros();
 				if (isDiagFrailty == 1) D = diagA(span(p, diagA.n_elem - 1));
 				else I.diag() = diagA;
+				int nEvents = 0;
 
 				for (int s = 0; s < (int) (strataBounds.n_rows); s++) {
 					// Traverse events within a strata
 					for (int i = strataBounds(s, 0); i <= strataBounds(s, 1); i++) {
 						if (event[i] == 0) break;
+						nEvents++;
+						updateTimeVarying(X, s, nEvents);
 						time = stop[i];
 						if(time<minstop - eps) continue;
 						if(time>maxstop + eps) break;
-						time_lb = time * (1 - eps);
-						time_ub = time * (1 + eps);
+						time_lb = time - eps; // numerical underflow may cause problem; that happens, change the inequality below
+						time_ub = time + eps;
 						nrisk = 0;
 						ntied = 0;
 						for (int j = i; j <= strataBounds(s, 1); j++) {
@@ -996,6 +997,8 @@ public:
 							throw std::invalid_argument( "Logical error: ntied<=0!" );
 						}
 						i += ntied - 1;
+						// skip if identified event not selected
+						if(!selected_events.is_empty() && all(selected_events!=nEvents)) continue;
 						// Update X
 						uvec v = uvec(riskset, nrisk, false, true);
 						vec wr = weight(v);
@@ -1003,17 +1006,6 @@ public:
 						umat groups = fgroups.rows(v);
 						umat tied_groups = groups.rows(0, ntied - 1);
 						mat Xr = X.cols(v);
-						// Deal with time-varying variables: Digg number and time, if subtracting mean before interaction, the results may be different with SAS
-						if (!timeVarIndex.is_empty()) {
-							if (ageIndex >= 0) {
-								if (isAbsoluteAge == 1) Xr.row(timeVarIndex[ageIndex]).fill(time / 86400.0);
-								else Xr.row(timeVarIndex[ageIndex]) = (time - Xr.row(timeVarIndex[ageIndex])) / 86400.0;
-							}
-							if (diggNumIndex >= 0 && isUpdateDiggNum == 1) {
-								Xr.row(timeVarIndex[diggNumIndex]).fill(X(timeVarIndex[diggNumIndex], i - ntied + 1));
-							}
-							for (a = 0; a < interMap.n_rows; a++) Xr.row(interMap(a, 0)) = Xr.row(interMap(a, 1)) % Xr.row(interMap(a, 2));
-						}
 						if (fixedCoefIndex >= 0) fixedCoefOffset = fixedCoef * Xr.row(fixedCoefIndex);
 						if (!dropFlag.is_empty()) Xr = Xr.rows(keepIndex);
 						centerX(Xr);
@@ -1162,11 +1154,7 @@ public:
 						D = Dn;
 						break;
 					}
-					if(nf>0 && eigPct<0.02 && ntrials>3){
-						eigPct *= 3;
-						Rcout << "Recalculating dbeta with eigPct increased to " << eigPct << endl;
-						beta = betaOld + getDbeta(U, I, isDiagFrailty == 1 ? D : vec());
-					} else  beta = (beta + betaOld) / 2;
+					beta = (beta + betaOld) / 2;
 					iter--; // not converging
 					ntrials++;
 				} else {
@@ -1191,10 +1179,6 @@ public:
 					Un = U;
 					In = I;
 					Dn = D;
-					if(nf>0 && mean( abs( dbeta(span(0,p-1)) ) ) < 0.02 && eigPct > 1e-3 + 1e-6) {
-						eigPct /= sqrt(3.0);
-						Rcout << "Last successful step is too small. Reducing eigPct to " << eigPct << endl;
-					}
 				}
 				if (iter == maxIter) Rcout << "Warning: the model is not converged after the maximal " << maxIter << " inner iterations\n";
 			} // end of inner loop
@@ -1309,6 +1293,51 @@ public:
 		return sp_mat(loc, values, d1, d1, false, false);
 	}
 
+	double diagAddVal(mat I, vec D = vec()){
+	    double min_diag = min(I.diag());
+	    if(! D.is_empty()) min_diag = fmin(min_diag, min(D));
+		double min_eig = 0;
+		double max_eig = 0;
+	    try{
+	        sp_mat newI(I);
+	        if(!D.is_empty()) newI = genSPI(I, D);
+	        vec eigval;
+	        if(newI.n_rows > 1){
+	            eigs_sym(eigval, newI, 1, "la");
+	            max_eig = max(eigval);
+	            eigs_sym(eigval, newI, 1, "sa");
+	            min_eig = min(eigval);
+	        } else if (newI.n_rows == 1) {
+	            max_eig = min_eig = arma::as_scalar(newI);
+	            //newI.print(Rcout,"newI=");
+	        } else {
+	            max_eig = min_eig = 0;
+	            Rcout << "@@@ Unexpected empty matrix newI" << endl;
+	        }
+	    } catch (const std::exception &exc) {
+	        Rcpp::Rcerr << exc.what();
+	        Rcout << "@@@ Decomposition error, will use min diag value if it is negative" << endl;
+	    }
+	    if (verbose >= 2)
+	        Rcout << "   Eig min/max " << min_eig << " / " << max_eig
+	            << ", min diag: " << min_diag << ", eigScalor: " << eigScalor
+                << ", eigPct: " << eigPct << endl;
+	    if(!std::isfinite(min_diag)) {
+	        I.print(Rcout, "@@@ Infinite min diag, I=");
+	        if(! D.is_empty()) D.print(Rcout, "D=");
+	        return min_diag;
+	    } else min_diag = fmin(0, min_diag);
+	    min_eig = std::isfinite(min_eig) ? fmin(min_eig, min_diag) : min_diag;
+	    if(verbose>1) Rcout << "min eig: " << min_eig << ", max eig pct: " << - max_eig * eigPct << endl;
+	    min_eig = fmin(min_eig, - max_eig * eigPct);
+	    if(verbose>1) Rcout << "min eig: " << min_eig << endl;
+		if(eigPct >= fmax(0.1, 100*eigPct_bak)){
+		    min_eig = fmin(min_eig, -1000);
+		    Rcout << "Too many recursive calls, make sure min_eig is smaller than -1000" << endl;
+		}
+		return fmax(-eigScalor*min_eig, 0);
+	}
+
 	/* It is yet not clear why sometimes some frailty's beta stays zero forever */
 	vec getDbeta(vec U, mat I, vec D = vec()) {
 		uword dim = U.n_elem;
@@ -1322,39 +1351,28 @@ public:
 		}
 		vec dbeta = zeros(U.n_elem);
 		try {
-			// check singularity first, otherwise often over reach
-			double minDiag = min(I.diag());
-			double maxDiag = max(I.diag());
-			if (!D.is_empty()) {
-				minDiag = fmin(minDiag, min(D));
-				maxDiag = fmax(maxDiag, max(D));
-			}else if (nf == 0) { // use eig decomposition for normal estimate
-				vec eigval = eig_sym(I);
-				minDiag = min(eigval);
-				maxDiag = max(eigval);
+			double add_diag = diagAddVal(I, D);
+		    if(!std::isfinite(add_diag)){
+		        dbeta.fill(datum::nan);
+		        return dbeta; // # elements might be incorrect, but doesn't matter
+		    }
+			if(add_diag>0){
+				if(verbose>1) Rcout << "Adding "
+					  << add_diag << " to the diagonal of information matrix" << endl;
+				I.diag() += add_diag;
+				if(!D.is_empty()) D += add_diag;
 			}
-			if (minDiag / maxDiag < eigPct) {
-				if (verbose >= 2)
-					Rcout << "@@@ Negative entries in information matrix diagonal! minDiag="
-					<< minDiag << ", max=" << maxDiag << ", min/max=" << minDiag / maxDiag << endl;
-				I.diag() += fmax(maxDiag * eigPct, -eigScalor * minDiag) * ones(I.n_cols);
-				if (!D.is_empty()) D += fmax(maxDiag * eigPct, -eigScalor * minDiag) * ones(D.n_elem);
-			}
-			superlu_opts settings;
-			settings.symmetric = true;
 			if (!D.is_empty()) {
-				dbeta = spsolve(genSPI(I, D), U, "superlu", settings);
-			} else if (nf > 0) {
-				dbeta = spsolve(sp_mat(I), U, "superlu", settings);
+				ivec P = linspace<ivec>((int) U.n_elem - 1, 0, U.n_elem);
+				dbeta = CoxReg::solveSparse(genSPI(I, D), U, P);
 			} else dbeta = solve(I, U);
 		} catch (...) {
-			Rcout << "@@@ Caution: unalbe to fixed the exception by adding scalor to diagnoal of I, stop updating here!!!" << endl;
-		}
-		if(nf>0 && any(abs(dbeta(span(0, p-1)))>1) && eigPct<0.02) {
-			eigPct *= 3;
-			Rcout << "Increasing eigPct to " << eigPct << endl;
+			Rcout << "@@@ Unalbe to compute dbeta when eigPct is " << eigPct
+					<< ", will double next time" << endl;
+			eigPct *= 2;
 			return getDbeta(U, I, D);
 		}
+		eigPct = eigPct_bak;
 		if (!validFrailty.is_empty() && dim > dbeta.n_elem) {
 			vec newdbeta = zeros(dim);
 			newdbeta(validFrailty) = dbeta;
@@ -1387,6 +1405,59 @@ public:
 		return inv;
 	}
 
+	/* solve Ax=b, A must be symmetric!!!
+	 * only the upper triangular part of A is required
+	 * but all entries of A should be provided when using the permutation input P of length N */
+	static vec solveSparse(sp_mat m, vec b, ivec P) {
+		LDL_int N = (LDL_int) m.n_rows;
+		//printf("Sparsity level of m=%g\n", (double) m.n_nonzero / (N * N));
+		LDL_int* Pinv = new LDL_int[N];
+		LDL_int* Lp = new LDL_int[N + 1];
+		LDL_int* Parent = new LDL_int[N];
+		LDL_int* Lnz = new LDL_int[N];
+		LDL_int* Flag = new LDL_int[N];
+
+		LDL_uint* Ap = m.col_ptrs; // pointing to constant data (modification forbidden)
+		LDL_uint* Ai = m.row_indices;
+		const double* Ax = m.values;
+
+		LDL_symbolic(N, Ap, Ai, Lp, Parent, Lnz, Flag, P.memptr(), Pinv);
+		//printf("Sparsity level of L=%g, nonzeros excluding diagonal=%d\n", (Lp[N] + N) / (double) LNZ, Lp[N]);
+
+		LDL_int LNZ = Lp[N]; // Number of nonzeros below the diagonal of L
+		LDL_int* Li = new LDL_int[LNZ];
+		double* Lx = new double[LNZ];
+		double* D = new double[N];
+		double* Y = new double[N];
+		LDL_int* Pattern = new LDL_int[N];
+		vec x = zeros(N); // save result
+
+		LDL_int d = LDL_numeric(N, Ap, Ai, Ax, Lp, Parent, Lnz, Li, Lx, D, Y, Pattern, Flag, P.memptr(), Pinv);
+
+		if (d == N) {
+			LDL_perm(N, Y, b.memptr(), P.memptr());
+			LDL_lsolve(N, Y, Lp, Li, Lx);
+			LDL_dsolve(N, Y, D);
+			LDL_ltsolve(N, Y, Lp, Li, Lx);
+			LDL_permt(N, x.memptr(), Y, P.memptr());
+		} else {
+			Rcout << "ldl_numeric failed, D (" << d << "," << d << ") is zero" << endl;
+			throw;
+		}
+
+		delete [] Pinv;
+		delete [] Li;
+		delete [] Lp;
+		delete [] Parent;
+		delete [] Lnz;
+		delete [] Flag;
+		delete [] Pattern;
+
+		delete [] Lx;
+		delete [] D;
+		delete [] Y;
+		return x;
+	}
 	void printDeltaType() {
 		Rcout << "The current delta type is " << deltaType << "\n";
 	}
